@@ -1,13 +1,78 @@
-FROM ghcr.io/project-osrm/osrm-backend:v5.27.1
+FROM alpine:3.21.2 AS alpine-mimalloc
 
-RUN apt-get update && apt-get install -y wget
+RUN apk update && \
+    apk upgrade && \
+    apk add --no-cache \
+        boost-iostreams \
+        boost-program_options \
+        boost-thread \
+        mimalloc
 
-WORKDIR /data
+ENV LD_PRELOAD=/usr/lib/libmimalloc.so.2
+ENV MIMALLOC_LARGE_OS_PAGES=1
 
-RUN wget -q https://download.geofabrik.de/.../sul-latest.osm.pbf
 
-RUN osrm-extract -p /opt/car.lua /data/sul-latest.osm.pbf
+FROM alpine-mimalloc AS builder
+ARG DOCKER_TAG
+ARG BUILD_CONCURRENCY
+
+RUN mkdir -p /src /opt && \
+    apk add --no-cache \
+    boost-dev \
+    boost-filesystem \
+    clang \
+    cmake \
+    expat-dev \
+    git \
+    libbz2 \
+    libxml2 \
+    lua5.4-dev \
+    make \
+    onetbb-dev
+
+COPY . /src
+WORKDIR /src
+
+RUN NPROC=${BUILD_CONCURRENCY:-$(nproc)} && \
+    echo "Building OSRM ${DOCKER_TAG}" && \
+    git show --format="%H" | head -n1 > /opt/OSRM_GITSHA && \
+    echo "Building OSRM gitsha $(cat /opt/OSRM_GITSHA)" && \
+    mkdir -p build && \
+    cd build && \
+    BUILD_TYPE="Release" && \
+    ENABLE_ASSERTIONS="Off" && \
+    case ${DOCKER_TAG} in *"-debug"*) BUILD_TYPE="Debug";; esac && \
+    case ${DOCKER_TAG} in *"-assertions"*) BUILD_TYPE="RelWithDebInfo" && ENABLE_ASSERTIONS="On";; esac && \
+    echo "Building ${BUILD_TYPE} with ENABLE_ASSERTIONS=${ENABLE_ASSERTIONS}" && \
+    cmake .. -DCMAKE_BUILD_TYPE=${BUILD_TYPE} -DENABLE_ASSERTIONS=${ENABLE_ASSERTIONS} -DENABLE_LTO=OFF && \
+    make -j${NPROC} install && \
+    cd ../profiles && \
+    cp -r * /opt && \
+    strip /usr/local/bin/* && \
+    rm -rf /src
+
+
+# Multistage build to reduce image size - https://docs.docker.com/build/building/multi-stage/#use-multi-stage-builds
+# Only the content below ends up in the image, this helps remove /src from the image (which is large)
+FROM alpine-mimalloc AS runstage
+
+COPY --from=builder /usr/local /usr/local
+COPY --from=builder /opt /opt
+
+RUN apk add --no-cache \
+    boost-date_time \
+    expat \
+    libcap-setcap \
+    lua5.4 \
+    onetbb && \
+    ldconfig /usr/local/lib
+
+RUN /usr/local/bin/osrm-extract --help && \
+    /usr/local/bin/osrm-routed --help && \
+    /usr/local/bin/osrm-contract --help && \
+    /usr/local/bin/osrm-partition --help && \
+    /usr/local/bin/osrm-customize --help
+
+WORKDIR /opt
 
 EXPOSE 5000
-
-CMD ["osrm-routed", "--algorithm=mld", "--port=5000"]
